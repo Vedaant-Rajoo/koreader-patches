@@ -7,13 +7,16 @@ local function install()
     assert(type(Feed.collect) == "function" and type(Feed.neighbor) == "function")
 
     local Net = require("meguru/net")
+    local Reader = require("meguru/ui/reader")
+    local NetworkMgr = require("ui/network/manager")
+    assert(type(Reader.install) == "function")
     local http = require("socket.http")
     local url = require("socket.url")
     local ltn12 = require("ltn12")
     local socketutil = require("socketutil")
     local Utf8Proc = require("ffi/utf8proc")
     local json = assert(Net.jsonDecoder())
-    local collect, neighbor = Feed.collect, Feed.neighbor
+    local collect, neighbor, installReader = Feed.collect, Feed.neighbor, Reader.install
     local metadata = setmetatable({}, { __mode = "k" })
     local cache
 
@@ -50,12 +53,8 @@ local function install()
             port = parsed.port, path = prefix .. "/api/graphql" }), id
     end
 
-    local function fetch(api, manga_id, opts)
-        local body = json.encode({
-            query = "query($mangaId:Int!){chapters(condition:{mangaId:$mangaId})"
-                .. "{nodes{id chapterNumber scanlator}}}",
-            variables = { mangaId = manga_id },
-        })
+    local function request(api, opts, query, variables)
+        local body = json.encode({ query = query, variables = variables })
         local chunks = {}
         local old_block, old_total = socketutil.block_timeout, socketutil.total_timeout
         local ok, status, code = pcall(function()
@@ -77,7 +76,7 @@ local function install()
                 source = ltn12.source.string(body),
                 sink = function(chunk, err)
                     size = size + (chunk and #chunk or 0)
-                    if size > 1024 * 1024 then return nil, "metadata too large" end
+                    if size > 1024 * 1024 then return nil, "response too large" end
                     return sink(chunk, err)
                 end,
             })
@@ -90,10 +89,17 @@ local function install()
         if not ok or not status or code ~= 200 then return end
         local decoded = json.decode(table.concat(chunks))
         if type(decoded) ~= "table" or decoded.errors ~= nil
-            or type(decoded.data) ~= "table"
-            or type(decoded.data.chapters) ~= "table"
-            or type(decoded.data.chapters.nodes) ~= "table" then return end
-        local nodes, by_id, count = decoded.data.chapters.nodes, {}, 0
+            or type(decoded.data) ~= "table" then return end
+        return decoded.data
+    end
+
+    local function fetch(api, manga_id, opts)
+        local data = request(api, opts,
+            "query($mangaId:Int!){chapters(condition:{mangaId:$mangaId})"
+                .. "{nodes{id chapterNumber scanlator}}}", { mangaId = manga_id })
+        if not data or type(data.chapters) ~= "table"
+            or type(data.chapters.nodes) ~= "table" then return end
+        local nodes, by_id, count = data.chapters.nodes, {}, 0
         for index, node in pairs(nodes) do
             if type(index) ~= "number" or index < 1 or index % 1 ~= 0
                 or type(node) ~= "table" or type(node.id) ~= "number"
@@ -113,7 +119,7 @@ local function install()
         return by_id
     end
 
-    local function enrich(items, walker, plan)
+    local function enrich(items, walker, plan, refresh)
         if type(items) ~= "table" or #items == 0 or not walker.complete then return end
         local api, manga_id = endpoint(plan)
         if not api then return end
@@ -126,7 +132,7 @@ local function install()
         end
         local opts = plan.walker_opts or {}
         local signature, now = table.concat(keys, "\n"), os.time()
-        if not cache or cache.api ~= api or cache.manga_id ~= manga_id
+        if refresh or not cache or cache.api ~= api or cache.manga_id ~= manga_id
             or cache.username ~= opts.username or cache.password ~= opts.password
             or cache.signature ~= signature or now >= cache.expires
             or now < cache.created then
@@ -182,8 +188,83 @@ local function install()
         return unpack(result, 1, result.n)
     end
 
-    -- No module mutation until every dependency and both wrappers are ready.
+    local function markDuplicates(desc)
+        if not NetworkMgr:isConnected() then return end
+        local plan = Feed.planForMarker(desc, { max_pages = Feed.TAP_PAGES, timeout = "resume" })
+        local api = endpoint(plan)
+        if not api then return end
+        local walker = Feed.walker(plan.url, plan.walker_opts)
+        while walker:step() do end
+        if not walker.complete then return end
+        local items = collect(walker, plan)
+        -- Writes must not use chapter numbers from the navigation cache.
+        enrich(items, walker, plan, true)
+        local sequence = Feed.ordered(items, { title_order = plan.driver.orderFromTitles })
+        local index
+        for i, item in ipairs(sequence) do
+            if not metadata[item] then return end
+            if item.item_key == desc.item_key then index = i end
+        end
+        if not index then return end
+        local number = metadata[sequence[index]].number
+        if number == nil then return true end
+        local first, last = index, index
+        while sequence[first - 1] and metadata[sequence[first - 1]].number == number do
+            first = first - 1
+        end
+        while sequence[last + 1] and metadata[sequence[last + 1]].number == number do
+            last = last + 1
+        end
+        if first == last then return true end
+        local ids, pending = {}, {}
+        for i = first, last do
+            local id = chapterId(sequence[i].item_key)
+            id = tonumber(id)
+            ids[#ids + 1], pending[id] = id, true
+        end
+        local data = request(api, plan.walker_opts or {},
+            "mutation($ids:[Int!]!){updateChapters(input:{ids:$ids,patch:{isRead:true}})"
+                .. "{chapters{id isRead}}}", { ids = ids })
+        local chapters = data and data.updateChapters and data.updateChapters.chapters
+        if type(chapters) ~= "table" then return end
+        for _, chapter in pairs(chapters) do
+            if type(chapter) ~= "table" or not pending[chapter.id]
+                or chapter.isRead ~= true then return end
+            pending[chapter.id] = nil
+        end
+        return next(pending) == nil
+    end
+
+    local function hookCompletion(plugin)
+        local ui = plugin and plugin.ui
+        local doc, status = ui and ui.document, ui and ui.status
+        if not (doc and doc.provider == "meguru" and type(doc.desc) == "table"
+            and doc.desc.server_kind == "suwayomi" and status
+            and type(status.onEndOfBook) == "function")
+            or status._newedia_dupread then return end
+        local onEndOfBook, completed = status.onEndOfBook, false
+        status.onEndOfBook = function(self, ...)
+            if not completed and ui.document == doc then
+                local ok, marked = pcall(markDuplicates, doc.desc)
+                completed = ok and marked == true
+                if not completed then
+                    require("logger").warn("Meguru duplicate read: sync not confirmed; finish again to retry")
+                end
+            end
+            return onEndOfBook(self, ...)
+        end
+        status._newedia_dupread = true
+    end
+
+    local function wrappedInstall(...)
+        local result = pack(installReader(...))
+        pcall(hookCompletion, ...)
+        return unpack(result, 1, result.n)
+    end
+
+    -- No module mutation until every dependency and wrapper is ready.
     Feed.collect, Feed.neighbor = wrappedCollect, selectNeighbor
+    Reader.install = wrappedInstall
     Feed._newedia_dupskip = true
 end
 

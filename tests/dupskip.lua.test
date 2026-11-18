@@ -21,10 +21,14 @@ local logger = { dbg = function() end, info = function() end,
     warn = function(message) state.logs[#state.logs + 1] = message end }
 package.loaded.logger = logger
 package.loaded.datastorage = {}
-package.loaded["meguru/sources"] = {}
+package.loaded["meguru/sources"] = { connection = function() return state.connection end }
+package.loaded["ui/network/manager"] = { isConnected = function() return not state.offline end }
 package.loaded["meguru/net"] = {
     jsonDecoder = function() return state.decoder_available and json or nil end,
-    fetchFeed = function() error("unexpected feed request") end,
+    fetchFeed = function(url)
+        state.feed_requests[#state.feed_requests + 1] = url
+        return state.feeds[url], "fixture failure"
+    end,
 }
 local socketutil = {}
 function socketutil:set_timeout(block, total)
@@ -40,7 +44,7 @@ function socketutil.table_sink(chunks)
     end
 end
 package.loaded.socketutil = socketutil
-package.loaded["socket.http"] = { request = function(request)
+local function serveRequest(request)
     state.requests[#state.requests + 1] = request
     equal(request.method, "POST")
     equal(request.redirect, false, "redirects must not forward credentials")
@@ -56,15 +60,35 @@ package.loaded["socket.http"] = { request = function(request)
     equal(request.headers["Content-Length"], tostring(#body))
     equal(request.headers["Content-Type"], "application/json")
     local query = assert(json.decode(body))
-    equal(query.query, "query($mangaId:Int!){chapters(condition:{mangaId:$mangaId}){nodes{id chapterNumber scanlator}}}")
-    equal(query.variables.mangaId, state.expected_manga or 7)
+    local mutation = query.query:match("^mutation") ~= nil
+    local response = state.response
+    if mutation then
+        equal(query.query, "mutation($ids:[Int!]!){updateChapters(input:{ids:$ids,patch:{isRead:true}}){chapters{id isRead}}}")
+        state.mutations[#state.mutations + 1] = query.variables.ids
+        local chapters = {}
+        for _, id in ipairs(query.variables.ids) do
+            chapters[#chapters + 1] = { id = id, isRead = true }
+        end
+        response = state.mutation_response or { data = { updateChapters = { chapters = chapters } } }
+    else
+        equal(query.query, "query($mangaId:Int!){chapters(condition:{mangaId:$mangaId}){nodes{id chapterNumber scanlator}}}")
+        equal(query.variables.mangaId, state.expected_manga or 7)
+    end
     if state.http_error then error("simulated transport exception") end
     if state.no_status then return nil, "timeout" end
     if state.slow then state.now = state.now + 5 end
-    local ok, reason = request.sink(state.body or json.encode(state.response))
+    local ok, reason = request.sink(state.body or json.encode(response))
     if not ok then return nil, reason end
     request.sink(nil)
-    return 1, state.code or 200, {}
+    return 1, (mutation and state.mutation_code) or state.code or 200, {}
+end
+package.loaded["socket.http"] = { request = function(request)
+    local ok, status, code, headers = pcall(serveRequest, request)
+    if not ok then
+        if not state.http_error then state.contract_errors[#state.contract_errors + 1] = status end
+        error(status)
+    end
+    return status, code, headers
 end }
 package.loaded.userpatch = { registerPatchPluginFunc = function(name, callback)
     equal(name, "meguru")
@@ -72,9 +96,16 @@ package.loaded.userpatch = { registerPatchPluginFunc = function(name, callback)
 end }
 os.time = function() return state.now end
 
-local Feed, original_neighbor, original_collect, driver
+local Feed, Reader, original_neighbor, original_collect, driver
 local function reset(skip_install)
-    state = { callbacks = {}, requests = {}, logs = {}, now = 1000, decoder_available = true }
+    local errors = state and state.contract_errors or {}
+    state = { callbacks = {}, requests = {}, logs = {}, now = 1000, decoder_available = true,
+        feeds = {}, feed_requests = {}, mutations = {}, contract_errors = errors }
+    Reader = { install = function(plugin)
+        state.installs = (state.installs or 0) + 1
+        return true, nil, "installed", nil
+    end }
+    package.loaded["meguru/ui/reader"] = Reader
     socketutil:set_timeout(17, 29)
     package.loaded["meguru/feed"] = nil
     Feed = require("meguru/feed")
@@ -112,11 +143,13 @@ local function nextIs(seq, current, expected, which)
 end
 local passed = 0
 local function test(name, run)
+    if state then state.contract_errors = {} end
     reset()
     local ok, message = pcall(run)
     if not ok then error(name .. ": " .. tostring(message), 0) end
     equal(socketutil.block_timeout, 17, "block timeout restored")
     equal(socketutil.total_timeout, 29, "total timeout restored")
+    equal(#state.contract_errors, 0, "HTTP contract errors: " .. table.concat(state.contract_errors, "; "))
     passed = passed + 1
     print("ok " .. passed .. " - " .. name)
 end
@@ -437,6 +470,202 @@ test("incomplete walks are not enriched and six-page limit is unchanged", functi
     walker.complete = false
     nextIs(sequence(walker, plan), "1", "2")
     equal(#state.requests, 0)
+end)
+
+-- Use the real plan builder, feed walker, parser, ordering, and GraphQL transport.
+-- Only the ReaderUI host and HTTP responses are synthetic.
+local function completionPlugin(walker, plan, current)
+    local url = require("socket.url")
+    local parsed = url.parse(plan.url)
+    parsed.path = parsed.path:match("^(.-)/series/")
+    parsed.query = nil
+    state.connection = { url = url.build(parsed), username = plan.walker_opts.username,
+        password = plan.walker_opts.password }
+    local doc = { provider = "meguru", desc = {
+        server_kind = "suwayomi", server_name = "fixture", series_remote_id = "7",
+        item_key = current or "1", lang = "en",
+    } }
+    local canonical = Feed.planForMarker(doc.desc, { max_pages = Feed.TAP_PAGES }).url
+    for i, page in ipairs(walker.pages) do
+        local page_url = i == 1 and canonical or canonical .. "&pageNumber=" .. i
+        state.feeds[page_url] = page.feed
+        if walker.pages[i + 1] then
+            page.feed.link = {{ rel = "next", href = canonical .. "&pageNumber=" .. (i + 1) }}
+        end
+    end
+    local status = { onEndOfBook = function(self, ...)
+        state.end_calls = (state.end_calls or 0) + 1
+        return "stock", nil, select("#", ...), nil
+    end }
+    local plugin = { ui = { document = doc, status = status } }
+    Reader.install(plugin)
+    return plugin, canonical
+end
+
+local function finish(plugin)
+    local function check(...)
+        equal(select("#", ...), 4, "stock end handler returns preserved")
+        local result, hole, count = ...
+        equal(result, "stock"); equal(hole, nil); equal(count, 2)
+    end
+    check(plugin.ui.status:onEndOfBook("event", nil))
+end
+
+local function marked(expected)
+    equal(#state.mutations, 1, "exactly one bulk write")
+    equal(table.concat(state.mutations[1], ","), expected, "only completed chapter group is marked")
+end
+
+test("completion marks current adjacent group only, once, across both sides and pages", function()
+    local walker, plan = fixture({0, 1.5, 1.5, 1.5, false, 1.5, 2, 2})
+    local entries = walker.pages[1].feed.entry
+    walker.pages[1].feed.entry = { entries[1], entries[2] }
+    walker.pages[2] = { feed = { entry = { entries[3], entries[4], entries[5], entries[6], entries[7], entries[8] } } }
+    local plugin, canonical = completionPlugin(walker, plan, "3")
+    equal(#state.requests, 0, "opening never changes progress")
+    finish(plugin)
+    marked("2,3,4")
+    equal(state.feed_requests[1], canonical)
+    equal(#state.feed_requests, 2)
+    equal(#state.requests, 2, "one fresh query and one write")
+    Reader.install(plugin)
+    finish(plugin)
+    marked("2,3,4")
+    equal(state.end_calls, 2, "both end events still reach stock handler")
+    equal(#state.requests, 2, "duplicate end events do not resync")
+end)
+
+test("last chapter and zero-number groups sync without any next chapter", function()
+    for _, numbers in ipairs({{0, 0}, {1, 2, 2}}) do
+        reset()
+        local walker, plan = fixture(numbers)
+        local plugin = completionPlugin(walker, plan, tostring(#numbers))
+        finish(plugin)
+        marked(#numbers == 2 and "1,2" or "2,3")
+    end
+end)
+
+test("navigation alone never marks current or destination alternatives read", function()
+    local walker, plan = fixture({1, 1, 2, 2})
+    completionPlugin(walker, plan)
+    local seq = sequence(walker, plan)
+    nextIs(seq, "1", "3")
+    nextIs(seq, "4", "2", "previous")
+    equal(#state.mutations, 0)
+end)
+
+test("completion rechecks chapter numbers instead of using warm navigation metadata", function()
+    local walker, plan = fixture({1, 1, 2, 2})
+    nextIs(sequence(walker, plan), "1", "3")
+    state.response.data.chapters.nodes[2].chapterNumber = 2
+    local plugin = completionPlugin(walker, plan)
+    finish(plugin)
+    equal(#state.requests, 2, "completion always queries fresh metadata")
+    equal(#state.mutations, 0, "formerly matching chapter is not marked")
+end)
+
+test("unknown, missing, remote, incomplete and partial metadata never write", function()
+    for _, mode in ipairs({"unknown", "missing", "remote", "incomplete", "partial", "graphql"}) do
+        reset()
+        local walker, plan = fixture(mode == "unknown" and {false, false, 2} or {1, 1, 2})
+        if mode == "remote" then walker.pages[1].feed.entry[2].id = "urn:suwayomi:chapter:2:remote" end
+        if mode == "partial" then state.response.data.chapters.nodes[3] = nil end
+        if mode == "graphql" then state.response.errors = {{ message = "Unauthorized" }} end
+        if mode == "incomplete" then
+            walker.pages[1].feed.link = {{rel = "next", href = "https://reader.invalid/missing"}}
+        end
+        local plugin = completionPlugin(walker, plan, mode == "missing" and "99" or "1")
+        finish(plugin)
+        equal(#state.mutations, 0, mode)
+        equal(state.end_calls, 1, "failure must preserve end-of-book behavior")
+    end
+end)
+
+test("six-page cap refuses completion writes even when current group was found", function()
+    local walker, plan = fixture({1, 1, 2})
+    local page = walker.pages[1]
+    for i = 2, 7 do walker.pages[i] = { feed = { entry = page.feed.entry } } end
+    local plugin = completionPlugin(walker, plan)
+    finish(plugin)
+    equal(#state.feed_requests, 6)
+    equal(#state.requests, 0)
+end)
+
+test("offline completion retries on a later finish without blocking stock behavior", function()
+    local walker, plan = fixture({1, 1, 2})
+    local plugin = completionPlugin(walker, plan)
+    state.offline = true
+    finish(plugin)
+    equal(#state.requests, 0)
+    equal(#state.feed_requests, 0)
+    state.offline = false
+    finish(plugin)
+    marked("1,2")
+    equal(state.end_calls, 2)
+end)
+
+test("failed or unconfirmed mutation retries; no credential-bearing errors escape", function()
+    for _, mode in ipairs({"http", "graphql", "partial", "wrong-id", "not-read", "shape"}) do
+        reset()
+        local walker, plan = fixture({1, 1, 2})
+        local plugin = completionPlugin(walker, plan)
+        if mode == "http" then state.mutation_code = 401
+        elseif mode == "graphql" then state.mutation_response = { errors = {{message = "SECRET"}} }
+        else
+            local chapters = {{id = 1, isRead = true}, {id = 2, isRead = true}}
+            if mode == "partial" then chapters[2] = nil end
+            if mode == "wrong-id" then chapters[2].id = 3 end
+            if mode == "not-read" then chapters[2].isRead = false end
+            state.mutation_response = { data = { updateChapters = mode == "shape" and 7 or { chapters = chapters } } }
+        end
+        finish(plugin)
+        equal(#state.logs, 1)
+        assert(not state.logs[1]:find("SECRET", 1, true))
+        equal(state.end_calls, 1)
+        state.mutation_code, state.mutation_response = nil, nil
+        finish(plugin)
+        equal(#state.mutations, 2, mode .. " retry")
+        finish(plugin)
+        equal(#state.mutations, 2, "confirmed success is not repeated")
+    end
+end)
+
+test("completion keeps configured origin, proxy prefix, account and per-reader state", function()
+    local walker, plan = fixture({1, 1, 2, 2})
+    plan.url = "https://second.invalid/proxy/api/opds/v1.2/series/7/chapters"
+    plan.walker_opts = { username = "fixture-account", password = "fixture-value" }
+    local plugin = completionPlugin(walker, plan)
+    finish(plugin)
+    marked("1,2")
+    for _, request in ipairs(state.requests) do
+        equal(request.url, "https://second.invalid/proxy/api/graphql")
+        equal(request.user, "fixture-account")
+        equal(request.password, "fixture-value")
+    end
+    local second = completionPlugin(walker, plan, "4")
+    finish(second)
+    equal(#state.mutations, 2)
+    equal(table.concat(state.mutations[2], ","), "3,4")
+end)
+
+test("local books, other drivers and replaced documents do not sync", function()
+    for _, mode in ipairs({"local", "komga", "kavita", "replaced"}) do
+        reset()
+        local walker, plan = fixture({1, 1, 2})
+        local plugin = completionPlugin(walker, plan)
+        if mode == "replaced" then
+            plugin.ui.document = {}
+        else
+            -- Install on a fresh status, as a newly opened book would.
+            plugin.ui.status = { onEndOfBook = function() return "stock", nil, 2, nil end }
+            if mode == "local" then plugin.ui.document.desc = nil
+            else plugin.ui.document.desc.server_kind = mode end
+            Reader.install(plugin)
+        end
+        finish(plugin)
+        equal(#state.requests, 0, mode)
+        equal(#state.feed_requests, 0, mode)
+    end
 end)
 
 os.time = original_time
