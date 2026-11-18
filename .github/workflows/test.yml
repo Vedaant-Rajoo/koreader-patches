@@ -15,5 +15,11 @@ jobs:
           ref: 7a6e9b8033c228c187855af8fcd4c4580018ac4b
           path: .test-meguru
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y luajit lua-socket lua-dkjson
-      - run: luajit tests/dupskip.lua.test .test-meguru
+      - uses: actions/checkout@v4
+        with:
+          repository: koreader/koreader-base
+          ref: f64c3eb11049e9a75189f186d7345d97c07d87b9
+          path: .test-koreader-base
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y luajit lua-socket lua-dkjson libutf8proc-dev
+      - run: luajit tests/dupskip.lua.test .test-meguru .test-koreader-base

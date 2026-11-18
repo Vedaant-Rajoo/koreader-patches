@@ -11,10 +11,20 @@ local function install()
     local url = require("socket.url")
     local ltn12 = require("ltn12")
     local socketutil = require("socketutil")
+    local Utf8Proc = require("ffi/utf8proc")
     local json = assert(Net.jsonDecoder())
     local collect, neighbor = Feed.collect, Feed.neighbor
     local metadata = setmetatable({}, { __mode = "k" })
     local cache
+
+    local function scanlatorKey(name)
+        if type(name) ~= "string" or name:find("\0", 1, true) then return end
+        -- Validate before calling the NUL-terminated native Unicode normalizer.
+        local _, valid = Utf8Proc.count(name)
+        if not valid then return end
+        name = Utf8Proc.lowercase(name):gsub("%s+", " "):match("^%s*(.-)%s*$")
+        return name ~= "" and name or nil
+    end
 
     local function chapterId(key)
         if type(key) ~= "string" then return end
@@ -95,8 +105,7 @@ local function install()
                 or number < 0 or number == math.huge then number = nil end
             by_id[tostring(node.id)] = {
                 number = number,
-                scanlator = type(node.scanlator) == "string"
-                    and node.scanlator:match("%S") and node.scanlator or nil,
+                scanlator = scanlatorKey(node.scanlator),
             }
             count = count + 1
         end

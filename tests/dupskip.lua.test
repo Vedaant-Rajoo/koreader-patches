@@ -1,7 +1,13 @@
 -- SPDX-License-Identifier: AGPL-3.0-or-later
 -- Run against real Meguru modules; only the KOReader host and HTTP are mocked.
-local meguru = assert(arg[1], "usage: luajit tests/dupskip.lua.test /path/to/meguru [/path/to/koreader]")
-package.path = meguru .. "/?.lua;" .. (arg[2] and arg[2] .. "/common/?.lua;" or "") .. package.path
+local meguru = assert(arg[1], "usage: luajit tests/dupskip.lua.test /path/to/meguru /path/to/koreader-or-base")
+local koreader = assert(arg[2], "KOReader or koreader-base source is required for its real Unicode helper")
+package.path = meguru .. "/?.lua;" .. koreader .. "/?.lua;" .. koreader .. "/common/?.lua;" .. package.path
+-- Use the host's utf8proc with KOReader's real FFI wrapper.
+local ffi = require("ffi")
+ffi.loadlib = function(name) return ffi.load(name) end
+if ffi.os == "Linux" then ffi.libc = "gnu" end
+require("ffi/utf8proc")
 local json = require("dkjson")
 package.loaded.socket = {}
 require("socket.url")
@@ -164,6 +170,41 @@ test("nearest fallback and empty scanlators", function()
     nextIs(seq, "1", "3")
     nextIs(seq, "2", "3")
     nextIs(seq, "5", "4", "previous")
+end)
+
+test("scanlator comparison normalizes case, whitespace and Unicode in both directions", function()
+    for _, names in ipairs({
+        {"  Group\t A \r\n", "group a"},
+        {"CAFÉ", "Cafe\204\129"},
+        {"Straße", "STRASSE"},
+        {"Ｇｒｏｕｐ\194\160Ａ", "group a"},
+    }) do
+        state.now = state.now + 61
+        local walker, plan = fixture({1, 1, 2, 2}, {names[1], "Other", "Other", names[2]})
+        local seq = sequence(walker, plan)
+        nextIs(seq, "1", "4")
+        nextIs(seq, "4", "1", "previous")
+        equal(state.response.data.chapters.nodes[1].scanlator, names[1], "source name stays unchanged")
+    end
+end)
+
+test("blank and invalid scanlators cannot gain a preference through normalization", function()
+    for _, name in ipairs({"", " \t", "\194\160", "\226\128\139", "Group A\0suffix", "Group A\255", json.null, false}) do
+        state.now = state.now + 61
+        local walker, plan = fixture({1, 1, 2, 2}, {name, "Other", "Other", "group a"})
+        state.response.data.chapters.nodes[1].scanlator = name
+        local seq = sequence(walker, plan)
+        nextIs(seq, "1", "3")
+        nextIs(seq, "4", "2", "previous")
+    end
+end)
+
+test("normalization does not infer group aliases or split collaboration credits", function()
+    for _, name in ipairs({"Group-A", "Group A & Group B", "Group B"}) do
+        state.now = state.now + 61
+        local seq = sequence(fixture({1, 1, 2, 2}, {name, "Other", "Other", "Group A"}))
+        nextIs(seq, "1", "3")
+    end
 end)
 
 test("zero, fractions, unknown and negative numbers stay distinct", function()

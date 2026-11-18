@@ -6,6 +6,13 @@ next skip adjacent releases with the same chapter number. In the next group,
 the patch prefers the current release's nonempty scanlator, otherwise the
 nearest entry in Meguru's existing reading order.
 
+Scanlator comparison uses KOReader's Unicode NFKC case folding, then trims and
+collapses ASCII whitespace. For example, ` Group A ` matches `group a`, and
+composed and decomposed accented names match. Normalized names stay private;
+displayed names and server metadata are unchanged. Blank or invalid UTF-8 names
+and names containing NUL have no preference. Group aliases and collaboration
+credits are not inferred or split.
+
 For example, next from `10 / Group A` in `10/A, 10/B, 11/B, 11/A, Special`
 opens `11/A`. The following next opens `Special`. Chapter `0` and fractions
 remain distinct. Unknown, malformed, or negative numbers are individual stops.
@@ -62,9 +69,9 @@ setting.
 The automated suite uses real Meguru 1.8.7 modules at
 `7a6e9b8033c228c187855af8fcd4c4580018ac4b`, including Feed, drivers, ordering, and
 same-ID deduplication. HTTP, plugin lifecycle, and KOReader's timeout host are
-mocked; JSON and URL parsing use real libraries. The reader source is checked
-for the shared manual/automatic navigation call site. This does not replace a
-reader or device test.
+mocked; JSON, URL parsing, and KOReader's Unicode helper use real libraries.
+The reader source is checked for the shared manual/automatic navigation call
+site. This does not replace a reader or device test.
 
 Desktop integration passed in isolated Docker with KOReader v2026.07, actual
 Meguru 1.8.7, and a synthetic HTTP OPDS/PSE and GraphQL server. Manual next and
@@ -87,10 +94,11 @@ KOReader v2026.07.1 and v2026.07.2 have identical `userpatch.lua` and
 `last` are omitted. Rendered Kindle behavior and other versions are not verified
 by this suite.
 
-Install LuaJIT, LuaSocket, and dkjson for the test host, then run from this repo:
+Install LuaJIT, LuaSocket, dkjson, and the utf8proc development library for the
+test host. Use KOReader's `koreader-base` source for its real Unicode helper:
 
 ```sh
-luajit tests/dupskip.lua.test /path/to/meguru
+luajit tests/dupskip.lua.test /path/to/meguru /path/to/koreader-base
 ```
 
 Alternatively, use the pure Lua libraries from a KOReader installation:
@@ -100,7 +108,9 @@ luajit tests/dupskip.lua.test /path/to/meguru /path/to/koreader
 ```
 
 Tests use `.lua.test` so Storefront does not expose them as installable patches.
-CI runs the same suite against the pinned Meguru source.
+CI runs the same suite against pinned Meguru and koreader-base sources.
+The earlier desktop and Kindle checks above predate scanlator normalization;
+the normalization regression tests do not replace another device test.
 
 For a reader integration check, use a disposable Suwayomi-compatible fixture
 with IDs `101:10/A, 102:10/B, 103:11/B, 104:11/A, 105:unknown, 106:12/A` in that
